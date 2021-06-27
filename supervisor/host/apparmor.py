@@ -1,4 +1,5 @@
 """AppArmor control for host."""
+from io import BufferedWriter
 import logging
 from pathlib import Path
 import shutil
@@ -111,10 +112,21 @@ class AppArmorControl(CoreSysAttributes):
 
     def backup_profile(self, profile_name, backup_file):
         """Backup A profile into a new file."""
-        profile_file = self._get_profile(profile_name)
+        profile_file: Path = self._get_profile(profile_name)
 
         try:
             shutil.copy(profile_file, backup_file)
+        except OSError as err:
+            _LOGGER.error("Can't backup profile %s: %s", profile_name, err)
+            raise HostAppArmorError() from err
+
+    def backup_profile_into(self, profile_name, backup_writer: BufferedWriter):
+        """Backup A profile into an open file."""
+        profile_file: Path = self._get_profile(profile_name)
+
+        try:
+            with profile_file.open("rb") as pf:
+                shutil.copyfileobj(pf, backup_writer)
         except OSError as err:
             _LOGGER.error("Can't backup profile %s: %s", profile_name, err)
             raise HostAppArmorError() from err

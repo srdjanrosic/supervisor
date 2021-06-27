@@ -1,10 +1,14 @@
 """Tarfile fileobject handler for encrypted files."""
+import asyncio
+import contextlib
 import hashlib
+from io import BytesIO
 import logging
 import os
 from pathlib import Path, PurePath
 import tarfile
-from typing import IO, Generator, List, Optional
+from tarfile import TarFile, TarInfo
+from typing import IO, TYPE_CHECKING, Callable, Generator, List, Optional
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
@@ -20,11 +24,12 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 BLOCK_SIZE = 16
 BLOCK_SIZE_BITS = 128
 
-MOD_READ = "r"
-MOD_WRITE = "w"
+
+def SecureTarReader(name: Path, key: Optional[bytes] = None, gzip: bool = True):
+    return _SecureTarFile(name, "r", key, gzip)
 
 
-class SecureTarFile:
+class _SecureTarFile:
     """Handle encrypted files for tarfile library."""
 
     def __init__(
@@ -63,7 +68,7 @@ class SecureTarFile:
         self._file = os.open(self._name, file_mode, 0o666)
 
         # Extract IV for CBC
-        if self._mode == MOD_READ:
+        if self._mode == "r":
             cbc_rand = os.read(self._file, 16)
         else:
             cbc_rand = os.urandom(16)
@@ -127,7 +132,7 @@ def _generate_iv(key: bytes, salt: bytes) -> bytes:
 def secure_path(tar: tarfile.TarFile) -> Generator[tarfile.TarInfo, None, None]:
     """Security safe check of path.
 
-    Prevent ../ or absolut paths
+    Prevent ../ or absolute paths
     """
     for member in tar:
         file_path = Path(member.name)
@@ -180,3 +185,128 @@ def atomic_contents_add(
         tar_file.add(directory_item.as_posix(), arcname=arcpath, recursive=False)
 
     return None
+
+
+class Adder(contextlib.AbstractAsyncContextManager):
+    """Interface allowing for archive contents to be added.
+
+    The API is async, and it's expected that the implementation will know
+    enough about the underlying streams avoid blocking where needed and remain efficient.
+    """
+
+    def __init__(self):
+        """Construct the object."""
+
+    async def add(
+        self,
+        name: str,
+        arcname: Optional[str] = None,
+        recursive: bool = True,
+        filter: Optional[Callable[[tarfile.TarInfo], Optional[tarfile.TarInfo]]] = None,
+    ):
+        ...
+
+    async def atomic_contents_add(
+        self, origin_path: Path, excludes: List[str], arcname: str = "."
+    ):
+        """Append directories and/or files to the TarFile if excludes wont filter."""
+
+    async def add_immediate(self, name: str, buf: memoryview, mode: int = 0o644):
+        """Write the contents of the memoryview as a file into the archive."""
+        ...
+
+    @contextlib.asynccontextmanager
+    async def add_open(
+        self, name: str, mode: int = 0o644
+    ) -> Generator[BytesIO, None, None]:
+        ...
+
+    @property
+    def size(self) -> float:
+        """Return size of archive in megabytes."""
+        ...
+
+
+class _AdderImpl:
+    """Wraps a tar archive."""
+
+    def __init__(self, name: Path, key: Optional[bytes] = None, gzip: bool = True):
+        self._secure_tar_file = _SecureTarFile(name, "w", key=key, gzip=gzip)
+        self._tar: Optional[TarFile] = None
+        self._exit_stack = contextlib.ExitStack()
+        self._closed = False
+
+    async def __aenter__(self) -> Adder:
+        self._tar = await asyncio.get_running_loop().run_in_executor(
+            None, self._exit_stack.enter_context, self._secure_tar_file
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        """Close any underlying files, or signal errors in case of exceptions."""
+        await asyncio.get_running_loop().run_in_executor(None, self._exit_stack.close)
+
+    async def add(
+        self,
+        name: str,
+        arcname: Optional[str] = None,
+        recursive: bool = True,
+        filter: Optional[Callable[[tarfile.TarInfo], Optional[tarfile.TarInfo]]] = None,
+    ):
+        await asyncio.get_running_loop().run_in_executor(
+            None,  # executor
+            self._tar.add,
+            name,
+            arcname,
+            recursive,
+            filter,
+        )
+
+    async def atomic_contents_add(
+        self, origin_path: Path, excludes: List[str], arcname: str = "."
+    ):
+        await asyncio.get_running_loop().run_in_executor(
+            None,  # executor
+            atomic_contents_add,
+            self._tar,
+            origin_path,
+            excludes,
+            arcname,
+        )
+
+    async def add_immediate(self, name: str, buf: memoryview, mode: int = 0o644):
+        tinfo = TarInfo(name)
+        sz = len(buf)
+        tinfo.size = sz
+        tinfo.mode = mode
+
+        def _add_blocking():
+            self._tar.addfile(tinfo)
+            self._tar.fileobj.write(buf)
+            padding = 512 - sz % 512
+            self._tar.fileobj.write(b"\0" * padding)
+            self._tar.offset += sz + padding
+
+        await asyncio.get_running_loop().run_in_executor(None, _add_blocking)
+
+    @contextlib.asynccontextmanager
+    async def add_open(
+        self, name: str, mode: int = 0o644
+    ) -> Generator[BytesIO, None, None]:
+        buf: BytesIO = BytesIO()
+        try:
+            yield buf
+        finally:
+            await self.add_immediate(name, buf.getbuffer(), mode=mode)
+
+    @property
+    def size(self) -> float:
+        """Return snapshot size."""
+        if not self._closed:
+            raise ValueError("cannot determine sized of yet to be written archive.")
+        return self._secure_tar_file.size
+
+
+def make_archive(name: Path, key: Optional[bytes] = None, gzip: bool = True) -> Adder:
+    """Make a new (optionally) secure archive on disk."""
+    return _AdderImpl(name, key, gzip)

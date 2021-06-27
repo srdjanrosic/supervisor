@@ -1,4 +1,5 @@
 """Test Tarfile functions."""
+import asyncio
 import os
 from pathlib import Path, PurePath
 import shutil
@@ -6,9 +7,10 @@ import shutil
 import attr
 
 from supervisor.utils.tar import (
-    SecureTarFile,
+    SecureTarReader,
     _is_excluded_by_filter,
     atomic_contents_add,
+    make_archive,
     secure_path,
 )
 
@@ -78,19 +80,24 @@ def test_create_pure_tar(tmp_path):
 
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarFile(temp_tar, "w") as tar_file:
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            excludes=[],
-            arcname=".",
-        )
+
+    async def make_archive_wrapper():
+        # exercise __aenter__/__aexit__ functionality.
+        async with make_archive(temp_tar) as ta:
+            await ta.add_immediate("foobar", bytes("just some data", "utf8"))
+            await ta.atomic_contents_add(
+                temp_orig,
+                excludes=[],
+                arcname=".",
+            )
+
+    asyncio.get_event_loop().run_until_complete(make_archive_wrapper())
 
     assert temp_tar.exists()
 
     # Restore
     temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(temp_tar, "r") as tar_file:
+    with SecureTarReader(temp_tar) as tar_file:
         tar_file.extractall(path=temp_new, members=tar_file)
 
     assert temp_new.is_dir()
@@ -104,6 +111,7 @@ def test_create_pure_tar(tmp_path):
         "775",
     ]
     assert temp_new.joinpath("README.md").is_file()
+    assert temp_new.joinpath("foobar").read_text() == "just some data"
 
 
 def test_create_ecrypted_tar(tmp_path):
@@ -117,19 +125,22 @@ def test_create_ecrypted_tar(tmp_path):
 
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarFile(temp_tar, "w", key=key) as tar_file:
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            excludes=[],
-            arcname=".",
-        )
+
+    async def make_archive_wrapper():
+        async with make_archive(temp_tar, key=key) as ta:
+            await ta.atomic_contents_add(
+                temp_orig,
+                excludes=[],
+                arcname=".",
+            )
+
+    asyncio.get_event_loop().run_until_complete(make_archive_wrapper())
 
     assert temp_tar.exists()
 
     # Restore
     temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(temp_tar, "r", key=key) as tar_file:
+    with SecureTarReader(temp_tar, key=key) as tar_file:
         tar_file.extractall(path=temp_new, members=tar_file)
 
     assert temp_new.is_dir()

@@ -15,7 +15,7 @@ from supervisor.resolution.data import Suggestion
 from supervisor.resolution.fixups.clear_full_snapshot import FixupClearFullSnapshot
 from supervisor.snapshots.snapshot import Snapshot
 from supervisor.utils.dt import utcnow
-from supervisor.utils.tar import SecureTarFile
+from supervisor.utils.tar import make_archive
 
 
 async def test_fixup(coresys: CoreSys, tmp_path):
@@ -30,7 +30,7 @@ async def test_fixup(coresys: CoreSys, tmp_path):
 
     for slug in ["sn1", "sn2", "sn3", "sn4", "sn5"]:
         temp_tar = Path(tmp_path, f"{slug}.tar")
-        with SecureTarFile(temp_tar, "w"):
+        async with make_archive(temp_tar):
             pass
         snapshot = Snapshot(coresys, temp_tar)
         snapshot._data = {  # pylint: disable=protected-access

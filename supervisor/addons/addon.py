@@ -16,6 +16,8 @@ import aiohttp
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
+from supervisor.utils import tar
+
 from ..const import (
     ATTR_ACCESS_TOKEN,
     ATTR_AUDIO_INPUT,
@@ -63,8 +65,8 @@ from ..hardware.data import Device
 from ..homeassistant.const import WSEvent, WSType
 from ..utils import check_port
 from ..utils.apparmor import adjust_profile
-from ..utils.json import read_json_file, write_json_file
-from ..utils.tar import atomic_contents_add, secure_path
+from ..utils.json import read_json_file, write_json, write_json_file
+from ..utils.tar import secure_path
 from .const import SnapshotAddonMode
 from .model import AddonModel, Data
 from .options import AddonOptions
@@ -694,7 +696,7 @@ class Addon(AddonModel):
             )
             raise AddonsError() from err
 
-    async def snapshot(self, tar_file: tarfile.TarFile) -> None:
+    async def snapshot(self, ta: tar.Adder) -> None:
         """Snapshot state of an add-on."""
         is_running = await self.is_running()
 
@@ -717,7 +719,8 @@ class Addon(AddonModel):
 
             # Store local configs/state
             try:
-                write_json_file(temp_path.joinpath("addon.json"), data)
+                async with ta.add_open("addon.json", mode=0o600) as f:
+                    write_json(f, data)
             except ConfigurationFileError as err:
                 _LOGGER.error("Can't save meta for %s", self.slug)
                 raise AddonsError() from err
@@ -731,22 +734,6 @@ class Addon(AddonModel):
                     _LOGGER.error("Can't backup AppArmor profile")
                     raise AddonsError() from err
 
-            # write into tarfile
-            def _write_tarfile():
-                """Write tar inside loop."""
-                with tar_file as snapshot:
-                    # Snapshot system
-
-                    snapshot.add(temp, arcname=".")
-
-                    # Snapshot data
-                    atomic_contents_add(
-                        snapshot,
-                        self.path_data,
-                        excludes=self.snapshot_exclude,
-                        arcname="data",
-                    )
-
             if (
                 is_running
                 and self.snapshot_mode == SnapshotAddonMode.HOT
@@ -759,7 +746,16 @@ class Addon(AddonModel):
 
             try:
                 _LOGGER.info("Building snapshot for add-on %s", self.slug)
-                await self.sys_run_in_executor(_write_tarfile)
+                # Snapshot system
+
+                await ta.add(temp, arcname=".")
+
+                # Snapshot data
+                await ta.atomic_contents_add(
+                    self.path_data,
+                    excludes=self.snapshot_exclude,
+                    arcname="data",
+                )
             except (tarfile.TarError, OSError) as err:
                 _LOGGER.error("Can't write tarfile %s: %s", tar_file, err)
                 raise AddonsError() from err

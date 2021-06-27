@@ -1,9 +1,10 @@
 """Tools file for Supervisor."""
 from datetime import datetime
+from io import BufferedWriter, TextIOWrapper
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from atomicwrites import atomic_write
 
@@ -30,6 +31,19 @@ class JSONEncoder(json.JSONEncoder):
             return o.as_dict()
 
         return json.JSONEncoder.default(self, o)
+
+
+def write_json(fp: IO[bytes], data: Any) -> None:
+    """Write JSON into a writer."""
+    try:
+        json.dump(
+            data,
+            TextIOWrapper(fp, encoding="utf-8", write_through=True),
+            indent=2,
+            cls=JSONEncoder,
+        )
+    except (OSError, ValueError, TypeError) as err:
+        raise JsonFileError(f"Can't write JSON: {err!s}", _LOGGER.error) from err
 
 
 def write_json_file(jsonfile: Path, data: Any) -> None:

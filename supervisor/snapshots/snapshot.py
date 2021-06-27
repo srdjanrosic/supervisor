@@ -46,8 +46,8 @@ from ..const import (
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import AddonsError
 from ..utils.json import write_json_file
-from ..utils.tar import SecureTarFile, atomic_contents_add, secure_path
-from .utils import key_to_iv, password_for_validating, password_to_key, remove_folder
+from ..utils.tar import SecureTarReader, make_archive, secure_path
+from .utils import key_to_iv, password_for_validating, remove_folder
 from .validate import ALL_FOLDERS, SCHEMA_SNAPSHOT
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -313,13 +313,12 @@ class Snapshot(CoreSysAttributes):
 
         async def _addon_save(addon: Addon):
             """Task to store an add-on into snapshot."""
-            addon_file = SecureTarFile(
-                Path(self._tmp.name, f"{addon.slug}.tar.gz"), "w", key=self._key
-            )
 
+            ta = make_archive(self._tmp.name, f"{addon.slug}.tar.gz", key=self._key)
             # Take snapshot
             try:
-                await addon.snapshot(addon_file)
+                async with ta:
+                    await addon.snapshot(ta)
             except AddonsError:
                 _LOGGER.error("Can't create snapshot for %s", addon.slug)
                 return
@@ -330,7 +329,7 @@ class Snapshot(CoreSysAttributes):
                     ATTR_SLUG: addon.slug,
                     ATTR_NAME: addon.name,
                     ATTR_VERSION: addon.version,
-                    ATTR_SIZE: addon_file.size,
+                    ATTR_SIZE: ta.size,
                 }
             )
 
@@ -348,8 +347,8 @@ class Snapshot(CoreSysAttributes):
 
         async def _addon_restore(addon_slug: str):
             """Task to restore an add-on into snapshot."""
-            addon_file = SecureTarFile(
-                Path(self._tmp.name, f"{addon_slug}.tar.gz"), "r", key=self._key
+            addon_file = SecureTarReader(
+                Path(self._tmp.name, f"{addon_slug}.tar.gz"), key=self._key
             )
 
             # If exists inside snapshot
@@ -375,7 +374,7 @@ class Snapshot(CoreSysAttributes):
         """Backup Supervisor data into snapshot."""
         folder_list: Set[str] = set(folder_list or ALL_FOLDERS)
 
-        def _folder_save(name: str):
+        async def _folder_save(name: str):
             """Take snapshot of a folder."""
             slug_name = name.replace("/", "_")
             tar_name = Path(self._tmp.name, f"{slug_name}.tar.gz")
@@ -389,9 +388,9 @@ class Snapshot(CoreSysAttributes):
             # Take snapshot
             try:
                 _LOGGER.info("Snapshot folder %s", name)
-                with SecureTarFile(tar_name, "w", key=self._key) as tar_file:
-                    atomic_contents_add(
-                        tar_file,
+                ta = make_archive(tar_name, key=self._key)
+                async with ta:
+                    await ta.atomic_contents_add(
                         origin_dir,
                         excludes=MAP_FOLDER_EXCLUDE.get(name, []),
                         arcname=".",
@@ -406,7 +405,7 @@ class Snapshot(CoreSysAttributes):
         # avoid issue on slow IO
         for folder in folder_list:
             try:
-                await self.sys_run_in_executor(_folder_save, folder)
+                await _folder_save(folder)
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Can't save folder %s: %s", folder, err)
 
@@ -432,7 +431,7 @@ class Snapshot(CoreSysAttributes):
             # Perform a restore
             try:
                 _LOGGER.info("Restore folder %s", name)
-                with SecureTarFile(tar_name, "r", key=self._key) as tar_file:
+                with SecureTarReader(tar_name, key=self._key) as tar_file:
                     tar_file.extractall(path=origin_dir, members=tar_file)
                 _LOGGER.info("Restore folder %s done", name)
             except (tarfile.TarError, OSError) as err:
