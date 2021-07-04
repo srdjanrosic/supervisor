@@ -9,7 +9,6 @@ import attr
 from supervisor.utils.tar import (
     SecureTarReader,
     _is_excluded_by_filter,
-    atomic_contents_add,
     make_archive,
     secure_path,
 )

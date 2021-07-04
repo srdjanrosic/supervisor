@@ -2,13 +2,13 @@
 import asyncio
 import contextlib
 import hashlib
-from io import BytesIO
+from io import BufferedReader, BufferedWriter, BytesIO
 import logging
 import os
 from pathlib import Path, PurePath
 import tarfile
 from tarfile import TarFile, TarInfo
-from typing import IO, TYPE_CHECKING, Callable, Generator, List, Optional
+from typing import Any, IO, Literal, TYPE_CHECKING, Callable, Generator, List, Optional
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
@@ -21,70 +21,93 @@ from cryptography.hazmat.primitives.ciphers import (
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-BLOCK_SIZE = 16
-BLOCK_SIZE_BITS = 128
+
+def _cipher(key: bytes, salt: bytes) -> Cipher:
+    temp_iv = key + salt
+    for _ in range(100):
+        temp_iv = hashlib.sha256(temp_iv).digest()
+    iv = temp_iv[:16]
+
+    return Cipher(
+        algorithms.AES(key),
+        modes.CBC(iv),
+        backend=default_backend(),
+    )
 
 
-def SecureTarReader(name: Path, key: Optional[bytes] = None, gzip: bool = True):
-    return _SecureTarFile(name, "r", key, gzip)
+class _SecureWriter:
+    def __init__(self, f: BufferedWriter, key: bytes) -> None:
+        self._file: BufferedWriter = f
+        rand = os.urandom(16)
+        f.write(rand)
+        self._encrypt: CipherContext = _cipher(key, rand).encryptor()
+        self._bytes_written: int = 0
+
+    def write(self, data: bytes):
+        """Writes the data.
+
+        Because AES is a block cipher the length of bytes written to the
+        underlying file might be longer or shorter than input data.
+        """
+        self._bytes_written += len(data)
+        ecrypted = self._encrypt.update(data)
+        self._file.write(ecrypted)
+
+    def close(self):
+        """Flushes any buffered data and closes the underlying file."""
+        # pad bytes to block size, as per PKCS7 it's the number of padded bytes
+        # that is the byte value
+        padding_len = 16 - self._bytes_written % 16
+        padding_data = padding_len.to_bytes(1, "little") * padding_len
+        self._file.write(self._encrypt.update(padding_data))
+        _LOGGER.critical("wrote padding: %r", padding_data)
+        # self._file.write(self._encrypt.finalize())
+        self._file.close()
+
+    def __enter__(self) -> "_SecureWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
 
-class _SecureTarFile:
+class _SecureReader:
+    def __init__(self, f: BufferedReader, key: bytes) -> None:
+        self._file: BufferedReader = f
+        rand = f.read(16)
+        self._decrypt: CipherContext = _cipher(key, rand).decryptor()
+
+    def read(self, n: int) -> bytes:
+        """Return the next n bytes."""
+        # only works if n is a multiple of 16.. it's ok for tar files and
+        return self._decrypt.update(self._file.read(n))
+
+    def close(self) -> None:
+        self._file.close()
+
+    def __enter__(self) -> "_SecureReader":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
+class _InsecureTarFile:
     """Handle encrypted files for tarfile library."""
 
-    def __init__(
-        self, name: Path, mode: str, key: Optional[bytes] = None, gzip: bool = True
-    ) -> None:
+    def __init__(self, name: Path, mode: Literal["r", "w"]) -> None:
         """Initialize encryption handler."""
-        self._file: Optional[IO[bytes]] = None
         self._mode: str = mode
         self._name: Path = name
 
-        # Tarfile options
         self._tar: Optional[tarfile.TarFile] = None
-        self._tar_mode: str = f"{mode}|gz" if gzip else f"{mode}|"
-
-        # Encryption/Description
-        self._aes: Optional[Cipher] = None
-        self._key: Optional[bytes] = key
-
-        # Function helper
-        self._decrypt: Optional[CipherContext] = None
-        self._encrypt: Optional[CipherContext] = None
+        self._tar_mode: str = f"{mode}|gz"
 
     def __enter__(self) -> tarfile.TarFile:
         """Start context manager tarfile."""
-        if not self._key:
-            self._tar = tarfile.open(
-                name=str(self._name), mode=self._tar_mode, dereference=False
-            )
-            return self._tar
-
-        # Encrypted/Decryped Tarfile
-        if self._mode.startswith("r"):
-            file_mode: int = os.O_RDONLY
-        else:
-            file_mode: int = os.O_WRONLY | os.O_CREAT
-        self._file = os.open(self._name, file_mode, 0o666)
-
-        # Extract IV for CBC
-        if self._mode == "r":
-            cbc_rand = os.read(self._file, 16)
-        else:
-            cbc_rand = os.urandom(16)
-            os.write(self._file, cbc_rand)
-
-        # Create Cipher
-        self._aes = Cipher(
-            algorithms.AES(self._key),
-            modes.CBC(_generate_iv(self._key, cbc_rand)),
-            backend=default_backend(),
+        self._tar = tarfile.open(
+            name=str(self._name), mode=self._tar_mode, dereference=False
         )
-
-        self._decrypt = self._aes.decryptor()
-        self._encrypt = self._aes.encryptor()
-
-        self._tar = tarfile.open(fileobj=self, mode=self._tar_mode, dereference=False)
         return self._tar
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -92,21 +115,6 @@ class _SecureTarFile:
         if self._tar:
             self._tar.close()
             self._tar = None
-        if self._file:
-            os.close(self._file)
-            self._file = None
-
-    def write(self, data: bytes) -> None:
-        """Write data."""
-        if len(data) % BLOCK_SIZE != 0:
-            padder = padding.PKCS7(BLOCK_SIZE_BITS).padder()
-            data = padder.update(data) + padder.finalize()
-
-        os.write(self._file, self._encrypt.update(data))
-
-    def read(self, size: int = 0) -> bytes:
-        """Read data."""
-        return self._decrypt.update(os.read(self._file, size))
 
     @property
     def path(self) -> Path:
@@ -121,12 +129,48 @@ class _SecureTarFile:
         return round(self._name.stat().st_size / 1_048_576, 2)  # calc mbyte
 
 
-def _generate_iv(key: bytes, salt: bytes) -> bytes:
-    """Generate an iv from data."""
-    temp_iv = key + salt
-    for _ in range(100):
-        temp_iv = hashlib.sha256(temp_iv).digest()
-    return temp_iv[:16]
+class _SecureTarFile:
+    """Handle encrypted files for tarfile library."""
+
+    def __init__(self, name: Path, mode: Literal["r", "w"], key: bytes) -> None:
+        """Initialize encryption handler."""
+        self._file: Any = None
+        self._name: Path = name
+
+        # Encrypted/Decryped Tarfile
+        if mode.startswith("r"):
+            self._file = _SecureReader(self._name.open("rb"), key)
+        else:
+            self._file = _SecureWriter(self._name.open("wb"), key)
+
+        tar_mode: str = f"{mode}|gz"
+        self._tar = tarfile.open(fileobj=self._file, mode=tar_mode, dereference=False)
+
+    def __enter__(self) -> tarfile.TarFile:
+        """Start context manager tarfile."""
+
+        return self._tar
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        """Close file."""
+        if self._tar:
+            self._tar.close()
+            self._tar = None
+        if self._file:
+            self._file.close()
+            self._file = None
+
+    @property
+    def path(self) -> Path:
+        """Return path object of tarfile."""
+        return self._name
+
+    @property
+    def size(self) -> float:
+        """Return snapshot size."""
+        if not self._name.is_file():
+            return 0
+        return round(self._name.stat().st_size / 1_048_576, 2)  # calc mbyte
 
 
 def secure_path(tar: tarfile.TarFile) -> Generator[tarfile.TarInfo, None, None]:
@@ -157,6 +201,13 @@ def _is_excluded_by_filter(path: PurePath, exclude_list: List[str]) -> bool:
         return True
 
     return False
+
+
+def SecureTarReader(name: Path, key: Optional[bytes] = None):
+    if not key:
+        return _InsecureTarFile(name, "r")
+    else:
+        return _SecureTarFile(name, "r", key)
 
 
 def atomic_contents_add(
@@ -230,8 +281,11 @@ class Adder(contextlib.AbstractAsyncContextManager):
 class _AdderImpl:
     """Wraps a tar archive."""
 
-    def __init__(self, name: Path, key: Optional[bytes] = None, gzip: bool = True):
-        self._secure_tar_file = _SecureTarFile(name, "w", key=key, gzip=gzip)
+    def __init__(self, name: Path, key: Optional[bytes] = None):
+        if not key:
+            self._secure_tar_file = _InsecureTarFile(name, "w")
+        else:
+            self._secure_tar_file = _SecureTarFile(name, "w", key)
         self._tar: Optional[TarFile] = None
         self._exit_stack = contextlib.ExitStack()
         self._closed = False
@@ -307,6 +361,6 @@ class _AdderImpl:
         return self._secure_tar_file.size
 
 
-def make_archive(name: Path, key: Optional[bytes] = None, gzip: bool = True) -> Adder:
+def make_archive(name: Path, key: Optional[bytes] = None) -> Adder:
     """Make a new (optionally) secure archive on disk."""
-    return _AdderImpl(name, key, gzip)
+    return _AdderImpl(name, key)
