@@ -2,16 +2,25 @@
 import asyncio
 import contextlib
 import hashlib
-from io import BufferedReader, BufferedWriter, BytesIO
+from io import BufferedReader, BytesIO
 import logging
 import os
 from pathlib import Path, PurePath
 import tarfile
 from tarfile import TarFile, TarInfo
-from typing import Any, IO, Literal, TYPE_CHECKING, Callable, Generator, List, Optional
+from typing import (
+    AsyncContextManager,
+    AsyncIterator,
+    BinaryIO,
+    Callable,
+    Generator,
+    List,
+    Optional,
+    Protocol,
+    Union,
+)
 
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import (
     Cipher,
     CipherContext,
@@ -20,6 +29,30 @@ from cryptography.hazmat.primitives.ciphers import (
 )
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+class WriterCloser(Protocol):
+    """Support write(...) and close()."""
+
+    def write(self, data: bytes) -> int:
+        """Write data bytes."""
+        ...
+
+    def close(self) -> None:
+        """Flush and releases any buffers and closes all handles."""
+        ...
+
+
+class ReaderCloser(Protocol):
+    """Support read(...) and close()."""
+
+    def read(self, n: int) -> bytes:
+        """Read up to _n_ bytes."""
+        ...
+
+    def close(self):
+        """Release any unread buffers and handles."""
+        ...
 
 
 def _cipher(key: bytes, salt: bytes) -> Cipher:
@@ -36,35 +69,40 @@ def _cipher(key: bytes, salt: bytes) -> Cipher:
 
 
 class _SecureWriter:
-    def __init__(self, f: BufferedWriter, key: bytes) -> None:
-        self._file: BufferedWriter = f
-        rand = os.urandom(16)
-        f.write(rand)
-        self._encrypt: CipherContext = _cipher(key, rand).encryptor()
+    def __init__(self, f: WriterCloser, key: bytes) -> None:
+        self._file: WriterCloser = f
+        self._rand: Union[bytes, None] = os.urandom(16)
+        self._encrypt: CipherContext = _cipher(key, self._rand).encryptor()
         self._bytes_written: int = 0
 
-    def write(self, data: bytes):
-        """Writes the data.
+    def write(self, data: bytes) -> int:
+        """Encrypt and write the data.
 
         Because AES is a block cipher the length of bytes written to the
         underlying file might be longer or shorter than input data.
         """
+        # write self._rand once, done at first write to make __init__ always
+        # non blocking, and simplify code somewhat.
+        if self._rand:
+            self._file.write(self._rand)
+            self._rand = None
         self._bytes_written += len(data)
         ecrypted = self._encrypt.update(data)
         self._file.write(ecrypted)
+        return len(data)
 
     def close(self):
-        """Flushes any buffered data and closes the underlying file."""
+        """Flush any buffered data, padding as necessary.
+
+        It does not close the underlying file, as it did not open it.
+        """
         # pad bytes to block size, as per PKCS7 it's the number of padded bytes
         # that is the byte value
         padding_len = 16 - self._bytes_written % 16
         padding_data = padding_len.to_bytes(1, "little") * padding_len
         self._file.write(self._encrypt.update(padding_data))
-        _LOGGER.critical("wrote padding: %r", padding_data)
-        # self._file.write(self._encrypt.finalize())
-        self._file.close()
 
-    def __enter__(self) -> "_SecureWriter":
+    def __enter__(self) -> WriterCloser:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -72,105 +110,34 @@ class _SecureWriter:
 
 
 class _SecureReader:
-    def __init__(self, f: BufferedReader, key: bytes) -> None:
-        self._file: BufferedReader = f
-        rand = f.read(16)
-        self._decrypt: CipherContext = _cipher(key, rand).decryptor()
+    def __init__(self, f: ReaderCloser, key: bytes) -> None:
+        self._file: ReaderCloser = f
+        self._key: bytes = key
+        # Initialized on first read, to make __init__ non-blocking.
+        self._decrypt: Optional[CipherContext] = None
 
     def read(self, n: int) -> bytes:
-        """Return the next n bytes."""
-        # only works if n is a multiple of 16.. it's ok for tar files and
-        return self._decrypt.update(self._file.read(n))
+        """Return at most the next n bytes."""
+        # only works if n is a multiple of 16.. it's ok for tar files that read
+        # 10k blocks by default.
+        if not self._decrypt:
+            decrypt = _cipher(self._key, self._file.read(16)).decryptor()
+            self._key = b""  # no need for key to stick around
+            self._decrypt = decrypt
+        else:
+            decrypt = self._decrypt
+        edata = self._file.read(n)
+        return decrypt.update(edata)
 
     def close(self) -> None:
+        """Close file handles and release any buffers."""
         self._file.close()
 
-    def __enter__(self) -> "_SecureReader":
+    def __enter__(self) -> ReaderCloser:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
-
-
-class _InsecureTarFile:
-    """Handle encrypted files for tarfile library."""
-
-    def __init__(self, name: Path, mode: Literal["r", "w"]) -> None:
-        """Initialize encryption handler."""
-        self._mode: str = mode
-        self._name: Path = name
-
-        self._tar: Optional[tarfile.TarFile] = None
-        self._tar_mode: str = f"{mode}|gz"
-
-    def __enter__(self) -> tarfile.TarFile:
-        """Start context manager tarfile."""
-        self._tar = tarfile.open(
-            name=str(self._name), mode=self._tar_mode, dereference=False
-        )
-        return self._tar
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        """Close file."""
-        if self._tar:
-            self._tar.close()
-            self._tar = None
-
-    @property
-    def path(self) -> Path:
-        """Return path object of tarfile."""
-        return self._name
-
-    @property
-    def size(self) -> float:
-        """Return snapshot size."""
-        if not self._name.is_file():
-            return 0
-        return round(self._name.stat().st_size / 1_048_576, 2)  # calc mbyte
-
-
-class _SecureTarFile:
-    """Handle encrypted files for tarfile library."""
-
-    def __init__(self, name: Path, mode: Literal["r", "w"], key: bytes) -> None:
-        """Initialize encryption handler."""
-        self._file: Any = None
-        self._name: Path = name
-
-        # Encrypted/Decryped Tarfile
-        if mode.startswith("r"):
-            self._file = _SecureReader(self._name.open("rb"), key)
-        else:
-            self._file = _SecureWriter(self._name.open("wb"), key)
-
-        tar_mode: str = f"{mode}|gz"
-        self._tar = tarfile.open(fileobj=self._file, mode=tar_mode, dereference=False)
-
-    def __enter__(self) -> tarfile.TarFile:
-        """Start context manager tarfile."""
-
-        return self._tar
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        """Close file."""
-        if self._tar:
-            self._tar.close()
-            self._tar = None
-        if self._file:
-            self._file.close()
-            self._file = None
-
-    @property
-    def path(self) -> Path:
-        """Return path object of tarfile."""
-        return self._name
-
-    @property
-    def size(self) -> float:
-        """Return snapshot size."""
-        if not self._name.is_file():
-            return 0
-        return round(self._name.stat().st_size / 1_048_576, 2)  # calc mbyte
 
 
 def secure_path(tar: tarfile.TarFile) -> Generator[tarfile.TarInfo, None, None]:
@@ -203,11 +170,14 @@ def _is_excluded_by_filter(path: PurePath, exclude_list: List[str]) -> bool:
     return False
 
 
-def SecureTarReader(name: Path, key: Optional[bytes] = None):
-    if not key:
-        return _InsecureTarFile(name, "r")
-    else:
-        return _SecureTarFile(name, "r", key)
+def SecureTarReader(name: Path, key: Optional[bytes] = None) -> TarFile:
+    """Return and open TarFile, decrypt file if key is provided."""
+    f: ReaderCloser = name.open("rb")
+    if key:
+        f = _SecureReader(f, key)
+    # As of 2021-07-11 the typeshed for tarfile.open is lacking overrides
+    # to recognize what's precisely needed for mode="r|gz"
+    return tarfile.open(None, mode="r|gz", fileobj=f)  # type: ignore
 
 
 def atomic_contents_add(
@@ -238,15 +208,19 @@ def atomic_contents_add(
     return None
 
 
-class Adder(contextlib.AbstractAsyncContextManager):
+class Adder(Protocol):
     """Interface allowing for archive contents to be added.
 
     The API is async, and it's expected that the implementation will know
     enough about the underlying streams avoid blocking where needed and remain efficient.
     """
 
-    def __init__(self):
+    def __init__(self, open_f: WriterCloser, key: Optional[bytes] = None):
         """Construct the object."""
+
+    async def aclose(self):
+        """Flushes all buffers, but does not close a previously opened file."""
+        ...
 
     async def add(
         self,
@@ -255,6 +229,7 @@ class Adder(contextlib.AbstractAsyncContextManager):
         recursive: bool = True,
         filter: Optional[Callable[[tarfile.TarInfo], Optional[tarfile.TarInfo]]] = None,
     ):
+        """Add a file from a filesystem, analogue to Tarfile.add."""
         ...
 
     async def atomic_contents_add(
@@ -262,43 +237,48 @@ class Adder(contextlib.AbstractAsyncContextManager):
     ):
         """Append directories and/or files to the TarFile if excludes wont filter."""
 
-    async def add_immediate(self, name: str, buf: memoryview, mode: int = 0o644):
-        """Write the contents of the memoryview as a file into the archive."""
-        ...
+    async def add_immediate(
+        self, name: str, buf: Union[memoryview, bytes], mode: int = 0o644
+    ):
+        """Write the contents of the buf as a file into the archive."""
 
-    @contextlib.asynccontextmanager
-    async def add_open(
+    def add_open(
         self, name: str, mode: int = 0o644
-    ) -> Generator[BytesIO, None, None]:
+    ) -> AsyncContextManager[WriterCloser]:
+        """Return a BufferedWriter that when closed will add buffer content."""
         ...
 
-    @property
-    def size(self) -> float:
-        """Return size of archive in megabytes."""
+    def add_nested_archive(
+        self, path: Path, key: Optional[bytes] = None
+    ) -> AsyncContextManager["Adder"]:
+        """Make a new archive within the current archive."""
         ...
 
 
-class _AdderImpl:
+class _AdderImpl(contextlib.AbstractAsyncContextManager[Adder]):
     """Wraps a tar archive."""
 
-    def __init__(self, name: Path, key: Optional[bytes] = None):
-        if not key:
-            self._secure_tar_file = _InsecureTarFile(name, "w")
-        else:
-            self._secure_tar_file = _SecureTarFile(name, "w", key)
-        self._tar: Optional[TarFile] = None
+    def __init__(self, open_f: WriterCloser, key: Optional[bytes] = None):
+        """Open a tar archive (non-blocking)."""
         self._exit_stack = contextlib.ExitStack()
-        self._closed = False
 
-    async def __aenter__(self) -> Adder:
-        self._tar = await asyncio.get_running_loop().run_in_executor(
-            None, self._exit_stack.enter_context, self._secure_tar_file
-        )
-        return self
+        # Optionally, wrap an open file with some encryption.
+        if key:
+            secure_f = _SecureWriter(open_f, key)
+            open_f = self._exit_stack.enter_context(secure_f)
 
-    async def __aexit__(self, exc_type, exc_value, traceback):
-        """Close any underlying files, or signal errors in case of exceptions."""
-        await asyncio.get_running_loop().run_in_executor(None, self._exit_stack.close)
+        self._file: WriterCloser = open_f
+        # As of 2021-07-01: There don't seem to be good type overrides for
+        # tarfile.open. Various type checkers think this needs a IO[Bytes] of
+        # some kind, but WriterCloser is enough for w|gz mode.
+        self._tar: TarFile = tarfile.open(None, mode="w|gz", fileobj=open_f)  # type: ignore
+        self._exit_stack.callback(self._tar.close)
+
+    def close(self):
+        self._exit_stack.close()
+
+    async def aclose(self):
+        await asyncio.get_running_loop().run_in_executor(None, self.close)
 
     async def add(
         self,
@@ -328,7 +308,9 @@ class _AdderImpl:
             arcname,
         )
 
-    async def add_immediate(self, name: str, buf: memoryview, mode: int = 0o644):
+    async def add_immediate(
+        self, name: str, buf: Union[memoryview, bytes], mode: int = 0o644
+    ):
         tinfo = TarInfo(name)
         sz = len(buf)
         tinfo.size = sz
@@ -346,21 +328,42 @@ class _AdderImpl:
     @contextlib.asynccontextmanager
     async def add_open(
         self, name: str, mode: int = 0o644
-    ) -> Generator[BytesIO, None, None]:
+    ) -> AsyncIterator[WriterCloser]:
         buf: BytesIO = BytesIO()
         try:
             yield buf
         finally:
             await self.add_immediate(name, buf.getbuffer(), mode=mode)
 
-    @property
-    def size(self) -> float:
-        """Return snapshot size."""
-        if not self._closed:
-            raise ValueError("cannot determine sized of yet to be written archive.")
-        return self._secure_tar_file.size
+    @contextlib.asynccontextmanager
+    async def add_nested_archive(self, path: Path, key: Optional[bytes] = None):
+        stack = contextlib.AsyncExitStack()
+        try:
+            open_f: WriterCloser = await stack.enter_async_context(
+                self.add_open(path.name)
+            )
+            open_a: Adder = await stack.enter_async_context(_AdderImpl(open_f, key))
+            yield open_a
+        finally:
+            await stack.aclose()
+
+    async def __aenter__(self) -> Adder:
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        """Close any underlying files, or signal errors in case of exceptions."""
+        await self.aclose()
 
 
-def make_archive(name: Path, key: Optional[bytes] = None) -> Adder:
-    """Make a new (optionally) secure archive on disk."""
-    return _AdderImpl(name, key)
+@contextlib.asynccontextmanager
+async def open_archive_async(name: Path, key: Optional[bytes] = None):
+    """Async friendly version of open_archive, delegates blocking to separate threadpool."""
+
+    open_f: Optional[WriterCloser] = None
+    try:
+        open_f = await asyncio.get_running_loop().run_in_executor(None, name.open, "wb")
+        async with _AdderImpl(open_f, key) as a:
+            yield a
+    finally:
+        if open_f is not None:
+            await asyncio.get_running_loop().run_in_executor(None, open_f.close)

@@ -1,10 +1,10 @@
 """Representation of a snapshot file."""
 from base64 import b64decode, b64encode
+from contextlib import AsyncExitStack
 import json
 import logging
 from pathlib import Path
 import tarfile
-from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Set
 
 from cryptography.hazmat.backends import default_backend
@@ -32,7 +32,6 @@ from ..const import (
     ATTR_REFRESH_TOKEN,
     ATTR_REGISTRIES,
     ATTR_REPOSITORIES,
-    ATTR_SIZE,
     ATTR_SLUG,
     ATTR_SSL,
     ATTR_TYPE,
@@ -45,9 +44,9 @@ from ..const import (
 )
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import AddonsError
-from ..utils.json import write_json_file
-from ..utils.tar import SecureTarReader, make_archive, secure_path
-from .utils import key_to_iv, password_for_validating, remove_folder
+from ..utils.json import write_json
+from ..utils.tar import Adder, SecureTarReader, open_archive_async, secure_path
+from .utils import key_to_iv, password_for_validating, password_to_key, remove_folder
 from .validate import ALL_FOLDERS, SCHEMA_SNAPSHOT
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -71,7 +70,8 @@ class Snapshot(CoreSysAttributes):
         self.coresys: CoreSys = coresys
         self._tarfile: Path = tar_file
         self._data: Dict[str, Any] = {}
-        self._tmp = None
+        self._stack = AsyncExitStack()
+        self._adder: Optional[Adder] = None  # used when creating snapshots.
         self._key: Optional[bytes] = None
         self._aes: Optional[Cipher] = None
 
@@ -149,12 +149,12 @@ class Snapshot(CoreSysAttributes):
     def size(self):
         """Return snapshot size."""
         if not self.tarfile.is_file():
-            return 0
+            return 0  # not yet created.
         return round(self.tarfile.stat().st_size / 1048576, 2)  # calc mbyte
 
     @property
     def is_new(self):
-        """Return True if there is new."""
+        """Return True if tarfile does not exist."""
         return not self.tarfile.exists()
 
     @property
@@ -205,7 +205,8 @@ class Snapshot(CoreSysAttributes):
         if not self._key or data is None:
             return data
 
-        encrypt = self._aes.encryptor()
+        aes: Cipher = self._aes  # type: ignore  # always initialized
+        encrypt = aes.encryptor()
         padder = padding.PKCS7(128).padder()
 
         data = padder.update(data.encode()) + padder.finalize()
@@ -216,7 +217,8 @@ class Snapshot(CoreSysAttributes):
         if not self._key or data is None:
             return data
 
-        decrypt = self._aes.decryptor()
+        aes: Cipher = self._aes  # type: ignore  # always initialized
+        decrypt = aes.decryptor()
         padder = padding.PKCS7(128).unpadder()
 
         data = padder.update(decrypt.update(b64decode(data))) + padder.finalize()
@@ -261,12 +263,31 @@ class Snapshot(CoreSysAttributes):
 
         return True
 
-    async def __aenter__(self):
-        """Async context to open a snapshot."""
-        self._tmp = TemporaryDirectory(dir=str(self.sys_config.path_tmp))
+    async def _add_snapshot_json(self):
+        """Serialize self._data into the archive as `snapshot.json`."""
+        # validate data
+        try:
+            self._data = SCHEMA_SNAPSHOT(self._data)
+        except vol.Invalid as err:
+            _LOGGER.error(
+                "Invalid data for %s: %s", self.tarfile, humanize_error(self._data, err)
+            )
+            raise ValueError("Invalid config") from None
 
-        # create a snapshot
+        async with self._adder.add_open("snapshot.json", mode=0o600) as buf:
+            write_json(buf, self._data)
+
+    async def __aenter__(self):
+        """Async context to open a snapshot, either new or an existing one."""
         if not self.tarfile.is_file():
+            # We're using this Snapshot instance to create a new snapshot.
+            # Initialize an Adder, and write out snapshot.json from already
+            # populated/stored _data.
+            self._adder = await self._stack.enter_async_context(
+                open_archive_async(self.tarfile, self._key)
+            )
+            # Add snapshot.json first.
+            await self._add_snapshot_json()
             return self
 
         # extract an existing snapshot
@@ -279,65 +300,40 @@ class Snapshot(CoreSysAttributes):
 
     async def __aexit__(self, exception_type, exception_value, traceback):
         """Async context to close a snapshot."""
-        # exists snapshot or exception on build
-        if self.tarfile.is_file() or exception_type is not None:
-            self._tmp.cleanup()
+        if not self._adder:
+            # We're using this Snapshot instance for a restore, nothing to do.
             return
 
-        # validate data
-        try:
-            self._data = SCHEMA_SNAPSHOT(self._data)
-        except vol.Invalid as err:
-            _LOGGER.error(
-                "Invalid data for %s: %s", self.tarfile, humanize_error(self._data, err)
-            )
-            raise ValueError("Invalid config") from None
+        await self._stack.aclose()
 
-        # new snapshot, build it
-        def _create_snapshot():
-            """Create a new snapshot."""
-            with tarfile.open(self.tarfile, "w:") as tar:
-                tar.add(self._tmp.name, arcname=".")
+    def store_addons_meta(self, addon_list: Optional[List[Addon]] = None):
+        """Add a list of add-ons into snapshot _data."""
+        addon_list: List[Addon] = addon_list or self.sys_addons.installed
 
-        try:
-            write_json_file(Path(self._tmp.name, "snapshot.json"), self._data)
-            await self.sys_run_in_executor(_create_snapshot)
-        except (OSError, json.JSONDecodeError) as err:
-            _LOGGER.error("Can't write snapshot: %s", err)
-        finally:
-            self._tmp.cleanup()
+        for addon in addon_list:
+            try:
+                # Store to config
+                self._data[ATTR_ADDONS].append(
+                    {
+                        ATTR_SLUG: addon.slug,
+                        ATTR_NAME: addon.name,
+                        ATTR_VERSION: addon.version,
+                    }
+                )
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Can't save Add-on %s: %s", addon.slug, err)
 
     async def store_addons(self, addon_list: Optional[List[Addon]] = None):
         """Add a list of add-ons into snapshot."""
-        addon_list: List[Addon] = addon_list or self.sys_addons.installed
+        addons: List[Addon] = addon_list or self.sys_addons.installed
 
-        async def _addon_save(addon: Addon):
-            """Task to store an add-on into snapshot."""
-
-            ta = make_archive(self._tmp.name, f"{addon.slug}.tar.gz", key=self._key)
-            # Take snapshot
+        for addon in addons:
             try:
-                async with ta:
-                    await addon.snapshot(ta)
-            except AddonsError:
-                _LOGGER.error("Can't create snapshot for %s", addon.slug)
-                return
-
-            # Store to config
-            self._data[ATTR_ADDONS].append(
-                {
-                    ATTR_SLUG: addon.slug,
-                    ATTR_NAME: addon.name,
-                    ATTR_VERSION: addon.version,
-                    ATTR_SIZE: ta.size,
-                }
-            )
-
-        # Save Add-ons sequential
-        # avoid issue on slow IO
-        for addon in addon_list:
-            try:
-                await _addon_save(addon)
+                adder = self._adder  # type: Adder
+                async with adder.add_nested_archive(
+                    f"{addon.slug}.tar.gz", key=self._key
+                ) as addon_archive:
+                    await addon.snapshot(addon_archive)
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Can't save Add-on %s: %s", addon.slug, err)
 
@@ -370,6 +366,20 @@ class Snapshot(CoreSysAttributes):
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Can't restore Add-on %s: %s", slug, err)
 
+    def store_folders_meta(self, folder_list: Optional[List[str]] = None):
+        """Backup Supervisor data into snapshot."""
+        folder_list: Set[str] = set(folder_list or ALL_FOLDERS)
+
+        for folder in sorted(folder_list):
+            try:
+                origin_dir = Path(self.sys_config.path_supervisor, folder)
+                if not origin_dir.is_dir():
+                    _LOGGER.warning("Can't find snapshot folder %s", folder)
+                    continue
+                self._data[ATTR_FOLDERS].append(folder)
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Can't save folder %s: %s", folder, err)
+
     async def store_folders(self, folder_list: Optional[List[str]] = None):
         """Backup Supervisor data into snapshot."""
         folder_list: Set[str] = set(folder_list or ALL_FOLDERS)
@@ -388,8 +398,7 @@ class Snapshot(CoreSysAttributes):
             # Take snapshot
             try:
                 _LOGGER.info("Snapshot folder %s", name)
-                ta = make_archive(tar_name, key=self._key)
-                async with ta:
+                async with open_archive_async(tar_name, key=self._key) as ta:
                     await ta.atomic_contents_add(
                         origin_dir,
                         excludes=MAP_FOLDER_EXCLUDE.get(name, []),
@@ -397,13 +406,12 @@ class Snapshot(CoreSysAttributes):
                     )
 
                 _LOGGER.info("Snapshot folder %s done", name)
-                self._data[ATTR_FOLDERS].append(name)
             except (tarfile.TarError, OSError) as err:
                 _LOGGER.warning("Can't snapshot folder %s: %s", name, err)
 
         # Save folder sequential
         # avoid issue on slow IO
-        for folder in folder_list:
+        for folder in sorted(folder_list):
             try:
                 await _folder_save(folder)
             except Exception as err:  # pylint: disable=broad-except

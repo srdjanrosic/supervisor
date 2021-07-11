@@ -9,7 +9,7 @@ import attr
 from supervisor.utils.tar import (
     SecureTarReader,
     _is_excluded_by_filter,
-    make_archive,
+    open_archive_async,
     secure_path,
 )
 
@@ -80,17 +80,17 @@ def test_create_pure_tar(tmp_path):
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
 
-    async def make_archive_wrapper():
-        # exercise __aenter__/__aexit__ functionality.
-        async with make_archive(temp_tar) as ta:
-            await ta.add_immediate("foobar", bytes("just some data", "utf8"))
+    async def open_archive_wrapper():
+        """wrap into async for test, that's how it'll be used."""
+        async with open_archive_async(temp_tar) as ta:
+            await ta.add_immediate("foobar", b"just some data")
             await ta.atomic_contents_add(
                 temp_orig,
                 excludes=[],
                 arcname=".",
             )
 
-    asyncio.get_event_loop().run_until_complete(make_archive_wrapper())
+    asyncio.get_event_loop().run_until_complete(open_archive_wrapper())
 
     assert temp_tar.exists()
 
@@ -125,15 +125,15 @@ def test_create_ecrypted_tar(tmp_path):
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
 
-    async def make_archive_wrapper():
-        async with make_archive(temp_tar, key=key) as ta:
+    async def open_archive_wrapper():
+        async with open_archive_async(temp_tar, key) as ta:
             await ta.atomic_contents_add(
                 temp_orig,
                 excludes=[],
                 arcname=".",
             )
 
-    asyncio.get_event_loop().run_until_complete(make_archive_wrapper())
+    asyncio.get_event_loop().run_until_complete(open_archive_wrapper())
 
     assert temp_tar.exists()
 

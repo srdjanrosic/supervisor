@@ -2,10 +2,12 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Awaitable, Set
+from typing import Awaitable, List, Set
 
 from awesomeversion.awesomeversion import AwesomeVersion
 from awesomeversion.exceptions import AwesomeVersionCompare
+
+from supervisor.addons.addon import Addon
 
 from ..const import FOLDER_HOMEASSISTANT, SNAPSHOT_FULL, SNAPSHOT_PARTIAL, CoreState
 from ..coresys import CoreSysAttributes
@@ -36,14 +38,16 @@ class SnapshotManager(CoreSysAttributes):
         """Return snapshot object."""
         return self.snapshots_obj.get(slug)
 
-    def _create_snapshot(self, name, sys_type, password, homeassistant=True):
+    def _create_snapshot(
+        self, name, sys_type, password, homeassistant=True
+    ) -> Snapshot:
         """Initialize a new snapshot object from name."""
         date_str = utcnow().isoformat()
         slug = create_slug(name, date_str)
-        tar_file = Path(self.sys_config.path_backup, f"{slug}.tar")
+        tar_path = Path(self.sys_config.path_backup, f"{slug}.tar")
 
         # init object
-        snapshot = Snapshot(self.coresys, tar_file)
+        snapshot = Snapshot(self.coresys, tar_path)
         snapshot.new(slug, name, date_str, sys_type, password)
 
         # set general data
@@ -134,13 +138,15 @@ class SnapshotManager(CoreSysAttributes):
             _LOGGER.error("A snapshot/restore process is already running")
             return None
 
-        snapshot = self._create_snapshot(name, SNAPSHOT_FULL, password)
-        _LOGGER.info("Creating new full-snapshot with slug %s", snapshot.slug)
         try:
             self.sys_core.state = CoreState.FREEZE
             await self.lock.acquire()
+            snapshot = self._create_snapshot(name, SNAPSHOT_FULL, password)
+            snapshot.store_addons_meta()
+            snapshot.store_folders_meta()
 
-            async with snapshot:
+            async with snapshot:  # starts writing the file
+                _LOGGER.info("Creating new full-snapshot with slug %s", snapshot.slug)
                 # Snapshot add-ons
                 _LOGGER.info("Snapshotting %s store Add-ons", snapshot.slug)
                 await snapshot.store_addons()
@@ -179,24 +185,28 @@ class SnapshotManager(CoreSysAttributes):
             _LOGGER.error("Nothing to create snapshot for")
             return
 
-        snapshot = self._create_snapshot(
-            name, SNAPSHOT_PARTIAL, password, homeassistant
-        )
-
-        _LOGGER.info("Creating new partial-snapshot with slug %s", snapshot.slug)
         try:
             self.sys_core.state = CoreState.FREEZE
             await self.lock.acquire()
 
-            async with snapshot:
+            addon_list: List[Addon] = []
+            for addon_slug in addons:
+                addon: Addon = self.sys_addons.get(addon_slug)
+                if addon and addon.is_installed:
+                    addon_list.append(addon)
+                    continue
+                _LOGGER.warning("Add-on %s not found/installed", addon_slug)
+
+            snapshot = self._create_snapshot(
+                name, SNAPSHOT_PARTIAL, password, homeassistant
+            )
+            snapshot.store_addons_meta(addon_list)
+            snapshot.store_folders_meta(folders)
+
+            _LOGGER.info("Creating new partial-snapshot with slug %s", snapshot.slug)
+
+            async with snapshot:  # starts writing the file
                 # Snapshot add-ons
-                addon_list = []
-                for addon_slug in addons:
-                    addon = self.sys_addons.get(addon_slug)
-                    if addon and addon.is_installed:
-                        addon_list.append(addon)
-                        continue
-                    _LOGGER.warning("Add-on %s not found/installed", addon_slug)
 
                 if addon_list:
                     _LOGGER.info("Snapshotting %s store Add-ons", snapshot.slug)
